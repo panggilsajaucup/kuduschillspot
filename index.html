@@ -1772,13 +1772,15 @@ async function submitPhotos() {
       const { data: urlData } = db.storage.from('shop-photos').getPublicUrl(path);
       const photoUrl = urlData?.publicUrl || '';
 
-      // Insert ke shop_photos dengan status PENDING
+      // Admin → langsung approved, user biasa → pending
+      const isAdmin = currentUser.role === 'admin' || currentUser.is_editor;
+      const photoStatus = isAdmin ? 'approved' : 'pending';
       await db.from('shop_photos').insert({
         shop_id: dbShopId,
         uploader_id: currentUser.id,
         storage_path: path,
         photo_url: photoUrl,
-        status: 'pending',
+        status: photoStatus,
         sort_order: uploaded
       });
       uploaded++;
@@ -1788,10 +1790,18 @@ async function submitPhotos() {
     renderUploadQueue();
 
     if (uploaded > 0) {
-      document.getElementById('uploadSuccessPopup').classList.add('open');
-      showToast(uploaded + ' foto dikirim untuk review editor!', 'success');
-      // Refresh badge pending di editor jika terbuka
-      updatePendingPhotoBadge?.();
+      const isAdmin = currentUser?.role === 'admin' || currentUser?.is_editor;
+      if (isAdmin) {
+        showToast(uploaded + ' foto langsung ditambahkan!', 'success');
+        const db2 = await getDB();
+        await loadPhotosForShops(db2);
+        renderCards(getSortedData());
+        if (typeof loadAllPendingCounts === 'function') await loadAllPendingCounts();
+      } else {
+        document.getElementById('uploadSuccessPopup').classList.add('open');
+        showToast(uploaded + ' foto dikirim untuk review editor!', 'success');
+        try { await updatePendingPhotoBadge(); } catch(e) {}
+      }
     } else {
       showToast('Semua file gagal diupload', 'error');
     }
@@ -1846,12 +1856,53 @@ document.addEventListener('keydown', e => {
 });
 
 function openEditor() {
+  const canEdit = currentUser?.role === 'admin' || currentUser?.is_editor;
+  if (!canEdit) { showToast('Akses editor ditolak. Login sebagai Admin.', 'error'); return; }
   document.getElementById('editor-panel').classList.add('open');
   document.body.style.overflow = 'hidden';
   const badge = document.getElementById('editorUserBadge');
-  if (badge) badge.textContent = currentUser ? ('Login sebagai: ' + currentUser.username) : 'Mode tamu';
+  if (badge) badge.textContent = 'Login sebagai: ' + (currentUser?.username || '—');
   renderEditorList('');
   updatePendingSubBadge();
+  loadAllPendingCounts(); // auto-load badge pending foto di semua tempat
+}
+
+// Hitung pending foto per shop dan update badge di sidebar
+async function loadAllPendingCounts() {
+  try {
+    const db = await getDB();
+    // Ambil semua foto pending + shop_id sekaligus
+    const { data, error } = await db
+      .from('shop_photos')
+      .select('shop_id')
+      .eq('status', 'pending');
+    if (error || !data) return;
+
+    // Hitung per shop_id
+    const countMap = {};
+    data.forEach(p => { countMap[p.shop_id] = (countMap[p.shop_id] || 0) + 1; });
+
+    // Update _pendingCount di RAW_DATA_LIVE
+    RAW_DATA_LIVE.forEach(shop => {
+      shop._pendingCount = countMap[shop._id] || 0;
+    });
+
+    // Update badge di tab Pengajuan Foto
+    const totalPending = data.length;
+    const badge = document.getElementById('pendingPhotoBadge');
+    if (badge) {
+      badge.textContent = totalPending;
+      badge.style.display = totalPending > 0 ? 'inline' : 'none';
+    }
+
+    // Re-render editor list untuk tampilkan badge per shop
+    renderEditorList(document.getElementById('editorSearch')?.value || '');
+  } catch(e) { console.warn('loadAllPendingCounts:', e); }
+}
+
+// Fungsi ini dipanggil dari submitPhotos (setelah user upload)
+async function updatePendingPhotoBadge() {
+  await loadAllPendingCounts();
 }
 function closeEditor() {
   document.getElementById('editor-panel').classList.remove('open');
@@ -1938,13 +1989,47 @@ function selectEditorShop(id) {
   }
 }
 
-function editorRemovePhoto(id, idx) {
-  const photos = photoDB[id] || [];
-  photos.splice(idx,1);
-  photoDB[id] = photos;
-  localStorage.setItem('kcs_photos', JSON.stringify(photoDB));
-  selectEditorShop(id);
-  showToast('Foto dihapus');
+async function editorRemovePhoto(shopId, idx) {
+  const shop = RAW_DATA_LIVE.find(d => d['No.'] == shopId || d._id == shopId);
+  const dbShopId = shop?._id;
+  const photos = shop?._photos || photoDB[shopId] || [];
+
+  if (!dbShopId || !photos[idx]) {
+    // Fallback: hapus dari localStorage saja
+    const localPhotos = photoDB[shopId] || [];
+    localPhotos.splice(idx, 1);
+    photoDB[shopId] = localPhotos;
+    localStorage.setItem('kcs_photos', JSON.stringify(photoDB));
+    selectEditorShop(shopId);
+    showToast('Foto dihapus (lokal)', 'warn');
+    return;
+  }
+
+  const photoUrl = photos[idx];
+  if (!confirm('Hapus foto ini dari database? Tidak bisa dikembalikan.')) return;
+
+  try {
+    const db = await getDB();
+    // Hapus record dari tabel shop_photos berdasarkan photo_url
+    const { error } = await db
+      .from('shop_photos')
+      .delete()
+      .eq('shop_id', dbShopId)
+      .eq('photo_url', photoUrl);
+
+    if (error) { showToast('Gagal hapus foto: ' + error.message, 'error'); return; }
+
+    // Update _photos di RAW_DATA_LIVE langsung
+    if (shop._photos) shop._photos.splice(idx, 1);
+
+    showToast('Foto berhasil dihapus dari database!', 'success');
+    // Reload foto dari DB untuk sinkronisasi penuh
+    await loadPhotosForShops(db);
+    selectEditorShop(shopId);
+    renderCards(getSortedData());
+  } catch(e) {
+    showToast('Gagal hapus: ' + e.message, 'error');
+  }
 }
 
 // editorApprovePending: sekarang handle dua sumber
@@ -3775,6 +3860,15 @@ async function rejectPhotoSubmission(photoId, btn) {
 function filterPhotoSubmissions(status) {
   currentPhotoFilter = status;
   loadPhotoSubmissions(status);
+}
+
+function previewPhotoSubmission(url) {
+  const modal = document.getElementById('photoPreviewModal');
+  const img   = document.getElementById('photoPreviewImg');
+  if (modal && img && url) {
+    img.src = url;
+    modal.style.display = 'flex';
+  }
 }
 
 // ============================
