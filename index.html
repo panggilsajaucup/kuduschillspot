@@ -1653,7 +1653,7 @@ function getShopStatus(shop, now) {
     if (next) {
       return {
         state: 'closed',
-        label: 'Tutup, buka pada ' + next.dayName + ' ' + _fmtTime(next.buka),
+        label: 'Buka pada ' + next.dayName + ' ' + _fmtTime(next.buka),
         isOpen: false, isGrayscale: true
       };
     }
@@ -1690,7 +1690,7 @@ function getShopStatus(shop, now) {
     if (next) {
       return {
         state:       'closed',
-        label:       'Tutup, buka pada ' + next.dayName + ' ' + _fmtTime(next.buka),
+        label:       'Buka pada ' + next.dayName + ' ' + _fmtTime(next.buka),
         isOpen:      false,
         isGrayscale: true
       };
